@@ -457,7 +457,7 @@ function buildRealMap(data, s, wst, n, e, lat0, name){
 }
 
 const PLACES = { castricum: [52.5486, 4.6693, 'Castricum'], amsterdam: [52.3731, 4.8926, 'Amsterdam'], alkmaar: [52.6324, 4.7534, 'Alkmaar'] };
-const OVERPASS = ['https://overpass-api.de/api/interpreter', 'https://overpass.kumi.systems/api/interpreter'];
+const OVERPASS = ['https://overpass-api.de/api/interpreter', 'https://overpass.private.coffee/api/interpreter', 'https://maps.mail.ru/osm/tools/overpass/api/interpreter', 'https://overpass.kumi.systems/api/interpreter'];
 async function fetchTimeout(url, opts, ms){
   const ac = new AbortController(); const id = setTimeout(() => ac.abort(), ms);
   try { return await fetch(url, Object.assign({}, opts, { signal: ac.signal })); } finally { clearTimeout(id); }
@@ -467,17 +467,31 @@ async function loadReal(lat, lon, name){
   const s = lat - dLat, n = lat + dLat, w = lon - dLon, e = lon + dLon;
   const bb = `${s.toFixed(6)},${w.toFixed(6)},${n.toFixed(6)},${e.toFixed(6)}`;
   const q = `[out:json][timeout:25];(way["highway"](${bb});way["building"](${bb});way["natural"~"^(water|wood)$"](${bb});way["waterway"](${bb});way["landuse"~"^(forest|grass|meadow|recreation_ground|village_green)$"](${bb});way["leisure"~"^(park|garden|pitch)$"](${bb}););out geom;`;
-  let blocked = true, lastErr = null;
-  for (const url of OVERPASS){
+  const ctrls = OVERPASS.map(() => new AbortController());
+  const fails = []; let blockedCount = 0, done = false;
+  const tryOne = async (url, i) => {
+    const host = new URL(url).host;
+    const id = setTimeout(() => ctrls[i].abort(), 45000);
     try {
-      const res = await fetchTimeout(url, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'data=' + encodeURIComponent(q) }, 30000);
-      blocked = false;
-      if (!res.ok){ lastErr = 'busy'; continue; }
+      const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'data=' + encodeURIComponent(q), signal: ctrls[i].signal });
+      if (!res.ok){ fails.push(host + ' ' + res.status); throw new Error('status'); }
       const data = await res.json();
-      return buildRealMap(data, s, w, n, e, lat, name);
-    } catch (err){ if (err && err.message === 'few'){ lastErr = 'few'; blocked = false; break; } if (err && err.name === 'AbortError'){ blocked = false; lastErr = 'busy'; } else lastErr = lastErr || 'blocked'; }
-  }
-  throw new Error(blocked ? 'blocked' : lastErr || 'busy');
+      if (!data || !Array.isArray(data.elements)){ fails.push(host + ' leeg'); throw new Error('bad'); }
+      return data;
+    } catch (err){
+      if (!done){
+        if (err && err.name === 'AbortError') fails.push(host + ' te traag');
+        else if (err instanceof TypeError){ blockedCount++; fails.push(host + ' geblokkeerd'); }
+        else if (err instanceof SyntaxError) fails.push(host + ' foute data');
+      }
+      throw err;
+    } finally { clearTimeout(id); }
+  };
+  let data;
+  try { data = await Promise.any(OVERPASS.map(tryOne)); }
+  catch (e){ const er = new Error(blockedCount === OVERPASS.length ? 'blocked' : 'busy'); er.detail = fails.join(', '); throw er; }
+  done = true; ctrls.forEach(c => c.abort());
+  return buildRealMap(data, s, w, n, e, lat, name);
 }
 
 /* ---------- game state ---------- */
@@ -1243,6 +1257,7 @@ function setState(s){
   state = s;
   $('#menu').classList.toggle('hidden', s !== 'menu');
   $('#loading').classList.toggle('hidden', s !== 'loading');
+  if (s === 'loading') $('#toast').classList.add('hidden');
   $('#pause').classList.toggle('hidden', s !== 'pause');
   $('#over').classList.toggle('hidden', s !== 'over');
   if (s !== 'play'){ touches.clear(); mouse.down = false; if (AC && engGain) engGain.gain.setTargetAtTime(0, AC.currentTime, 0.05); }
@@ -1267,7 +1282,7 @@ async function startReal(lat, lon, name){
     const m = err && err.message;
     if (m === 'blocked'){ toast('Echte kaarten laden lukt hier niet: deze pagina mag geen kaartdata ophalen. Zet het bestand op je eigen site, zoals GitHub Pages, dan werkt het wel. Je speelt nu Pixelstad.', 9000); startPixel(); }
     else if (m === 'few'){ toast('Rond ' + name + ' liggen te weinig wegen om op te spelen. Kies een plek midden in een dorp of stad.'); map = genCity(pixelSeed); setState('menu'); }
-    else { toast('OpenStreetMap reageert nu niet. Probeer het over een minuut opnieuw of speel Pixelstad.'); map = genCity(pixelSeed); setState('menu'); }
+    else { toast('Geen kaartserver gaf antwoord' + (err && err.detail ? ' (' + err.detail + ')' : '') + '. Probeer het over een minuut opnieuw of speel Pixelstad.', 12000); map = genCity(pixelSeed); setState('menu'); }
   }
 }
 document.querySelectorAll('[data-loc]').forEach(b => b.addEventListener('click', () => {
