@@ -91,7 +91,7 @@ button.primary{background:var(--amber);color:#1b1f3b}
       <b>E</b> in- of uitstappen, <b>spatie</b> handrem<br>
       <b>Q</b> ander wapen, <b>P</b> pauze, <b>M</b> geluid
     </div>
-    <div class="foot"><span>Record <b id="bestScore">0</b></span><span>Echte kaarten: © OpenStreetMap</span></div>
+    <div class="foot"><span>Record <b id="bestScore">0</b></span><span>Echte kaarten: © OpenStreetMap, OpenFreeMap, OpenMapTiles</span></div>
   </div>
 </div>
 
@@ -462,13 +462,126 @@ async function fetchTimeout(url, opts, ms){
   const ac = new AbortController(); const id = setTimeout(() => ac.abort(), ms);
   try { return await fetch(url, Object.assign({}, opts, { signal: ac.signal })); } finally { clearTimeout(id); }
 }
+/* vector tiles (OpenFreeMap, OpenMapTiles schema) */
+const td = new TextDecoder();
+function packed(sub){ const out = []; let p = 0; while (p < sub.length){ let r = 0, m = 1, b; do { b = sub[p++]; r += (b & 0x7f) * m; m *= 128; } while (b & 0x80 && p < sub.length); out.push(r); } return out; }
+function pbfFields(buf, cb){
+  let p = 0;
+  const varint = () => { let r = 0, m = 1, b; do { b = buf[p++]; r += (b & 0x7f) * m; m *= 128; } while (b & 0x80 && p < buf.length); return r; };
+  while (p < buf.length){
+    const tag = varint(), f = Math.floor(tag / 8), wt = tag & 7;
+    if (wt === 0) cb(f, wt, varint());
+    else if (wt === 2){ const len = varint(), s0 = p; p += len; cb(f, wt, buf.subarray(s0, s0 + len)); }
+    else if (wt === 1){ cb(f, wt, buf.subarray(p, p + 8)); p += 8; }
+    else if (wt === 5){ cb(f, wt, buf.subarray(p, p + 4)); p += 4; }
+    else break;
+  }
+}
+function geomRings(g){
+  const rings = []; let x = 0, y = 0, cur = null, i = 0;
+  while (i < g.length){
+    const c = g[i++], id = c & 7, n = c >> 3;
+    if (id === 1 || id === 2){
+      for (let k = 0; k < n && i + 1 < g.length; k++){ const dx = g[i++], dy = g[i++]; x += (dx >> 1) ^ -(dx & 1); y += (dy >> 1) ^ -(dy & 1);
+        if (id === 1){ cur = [[x, y]]; rings.push(cur); } else if (cur) cur.push([x, y]); }
+    } else if (id === 7){ if (cur && cur.length) cur.push([cur[0][0], cur[0][1]]); }
+    else break;
+  }
+  return rings;
+}
+function decodeMVT(u8){
+  const layers = {};
+  pbfFields(u8, (f, wt, v) => {
+    if (f !== 3 || wt !== 2) return;
+    let name = '', extent = 4096; const keys = [], vals = [], feats = [];
+    pbfFields(v, (lf, lwt, lv) => {
+      if (lf === 1) name = td.decode(lv);
+      else if (lf === 2) feats.push(lv);
+      else if (lf === 3) keys.push(td.decode(lv));
+      else if (lf === 4){ let val = null; pbfFields(lv, (vf, vwt, vv) => {
+          if (vf === 1) val = td.decode(vv);
+          else if (vf === 2) val = new DataView(vv.buffer, vv.byteOffset, 4).getFloat32(0, true);
+          else if (vf === 3) val = new DataView(vv.buffer, vv.byteOffset, 8).getFloat64(0, true);
+          else if (vf === 4 || vf === 5) val = vv;
+          else if (vf === 6) val = (vv % 2) ? -(vv + 1) / 2 : vv / 2;
+          else if (vf === 7) val = !!vv; }); vals.push(val); }
+      else if (lf === 5) extent = lv;
+    });
+    layers[name] = { extent, features: feats.map(fb => {
+      const ft = { type: 0, tags: {}, rings: [] }; let tg = [], gm = [];
+      pbfFields(fb, (ff, fwt, fv) => { if (ff === 2 && fwt === 2) tg = packed(fv); else if (ff === 3) ft.type = fv; else if (ff === 4 && fwt === 2) gm = packed(fv); });
+      for (let i = 0; i + 1 < tg.length; i += 2) ft.tags[keys[tg[i]]] = vals[tg[i + 1]];
+      ft.rings = geomRings(gm); return ft; }) };
+  });
+  return layers;
+}
+function ringArea(r){ let a = 0; for (let i = 0, j = r.length - 1; i < r.length; j = i++) a += r[j][0] * r[i][1] - r[i][0] * r[j][1]; return a / 2; }
+const HWMAP = { motorway: 'motorway', trunk: 'trunk', primary: 'primary', secondary: 'secondary', tertiary: 'tertiary', minor: 'residential', service: 'service', track: 'track', busway: 'service', raceway: 'service' };
+const PATHSUB = { footway: 1, cycleway: 1, path: 1, pedestrian: 1, steps: 1, bridleway: 1 };
+function mvtToElements(layers, z, tx, ty, out){
+  const nn = 2 ** z;
+  const add = (L, ft, tags, poly) => {
+    const ext = L.extent || 4096;
+    const conv = q => { const X = (tx + q[0] / ext) / nn, Y = (ty + q[1] / ext) / nn; return { lon: X * 360 - 180, lat: Math.atan(Math.sinh(Math.PI * (1 - 2 * Y))) * 180 / Math.PI }; };
+    for (const ring of ft.rings){
+      if (ring.length < 2) continue;
+      if (poly && (ring.length < 4 || ringArea(ring) <= 0)) continue;
+      out.push({ type: 'way', id: out.length, tags, geometry: ring.map(conv) });
+    }
+  };
+  const each = (name, fn) => { const L = layers[name]; if (L) for (const ft of L.features) fn(L, ft, ft.tags || {}); };
+  each('transportation', (L, ft, k) => {
+    let hw = HWMAP[k.class];
+    if (k.class === 'path') hw = PATHSUB[k.subclass] ? k.subclass : 'footway';
+    if (!hw) return;
+    const tags = { highway: hw }; if (k.brunnel === 'tunnel') tags.tunnel = 'yes';
+    if (ft.type === 3){ if (k.class === 'path' || k.subclass === 'pedestrian'){ tags.highway = 'pedestrian'; tags.area = 'yes'; add(L, ft, tags, true); } }
+    else if (ft.type === 2) add(L, ft, tags, false);
+  });
+  each('building', (L, ft) => { if (ft.type === 3) add(L, ft, { building: 'yes' }, true); });
+  each('water', (L, ft) => { if (ft.type === 3) add(L, ft, { natural: 'water' }, true); });
+  each('waterway', (L, ft, k) => { if (ft.type === 2 && k.brunnel !== 'tunnel') add(L, ft, { waterway: k.class }, false); });
+  each('landcover', (L, ft, k) => { if (ft.type !== 3) return; if (k.class === 'wood') add(L, ft, { natural: 'wood' }, true); else if (k.class === 'grass') add(L, ft, { landuse: 'grass' }, true); });
+  each('park', (L, ft, k) => { if (ft.type === 3 && k.class === 'park') add(L, ft, { leisure: 'park' }, true); });
+}
+async function unzipIfNeeded(u8){
+  if (u8[0] === 0x1f && u8[1] === 0x8b && typeof DecompressionStream !== 'undefined')
+    return new Uint8Array(await new Response(new Blob([u8]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer());
+  return u8;
+}
+async function loadVector(s, w, n, e){
+  let tpl = 'https://tiles.openfreemap.org/planet/latest/{z}/{x}/{y}.pbf';
+  try { const tj = await (await fetchTimeout('https://tiles.openfreemap.org/planet', {}, 12000)).json(); if (tj && tj.tiles && tj.tiles[0]) tpl = tj.tiles[0]; }
+  catch (err){ if (err instanceof TypeError) throw err; }
+  const z = 14, N = 2 ** z;
+  const lx = lon => Math.floor((lon + 180) / 360 * N);
+  const ly = lat => { const r = lat * Math.PI / 180; return Math.floor((1 - Math.log(Math.tan(r) + 1 / Math.cos(r)) / Math.PI) / 2 * N); };
+  const jobs = [];
+  for (let x = lx(w); x <= lx(e); x++) for (let y = ly(n); y <= ly(s); y++) jobs.push((async () => {
+    const res = await fetchTimeout(tpl.replace('{z}', z).replace('{x}', x).replace('{y}', y), {}, 20000);
+    if (res.status === 204 || res.status === 404) return null;
+    if (!res.ok) throw new Error('tegel ' + res.status);
+    const u8 = await unzipIfNeeded(new Uint8Array(await res.arrayBuffer()));
+    return { x, y, layers: decodeMVT(u8) };
+  })());
+  const tiles = await Promise.all(jobs);
+  const els = []; for (const t of tiles) if (t) mvtToElements(t.layers, z, t.x, t.y, els);
+  return { elements: els };
+}
+
 async function loadReal(lat, lon, name){
   const Rm = 520, dLat = Rm / 111320, dLon = Rm / (111320 * Math.cos(lat * Math.PI / 180));
   const s = lat - dLat, n = lat + dLat, w = lon - dLon, e = lon + dLon;
   const bb = `${s.toFixed(6)},${w.toFixed(6)},${n.toFixed(6)},${e.toFixed(6)}`;
   const q = `[out:json][timeout:25];(way["highway"](${bb});way["building"](${bb});way["natural"~"^(water|wood)$"](${bb});way["waterway"](${bb});way["landuse"~"^(forest|grass|meadow|recreation_ground|village_green)$"](${bb});way["leisure"~"^(park|garden|pitch)$"](${bb}););out geom;`;
-  const ctrls = OVERPASS.map(() => new AbortController());
   const fails = []; let blockedCount = 0, done = false;
+  try { const vdata = await loadVector(s, w, n, e); return buildRealMap(vdata, s, w, n, e, lat, name); }
+  catch (err){
+    if (err && err.message === 'few') throw err;
+    if (err instanceof TypeError) blockedCount++;
+    fails.push('openfreemap ' + (err && err.name === 'AbortError' ? 'te traag' : err instanceof TypeError ? 'geblokkeerd' : (err && err.message) || 'fout'));
+  }
+  const ctrls = OVERPASS.map(() => new AbortController());
   const tryOne = async (url, i) => {
     const host = new URL(url).host;
     const id = setTimeout(() => ctrls[i].abort(), 45000);
@@ -489,7 +602,7 @@ async function loadReal(lat, lon, name){
   };
   let data;
   try { data = await Promise.any(OVERPASS.map(tryOne)); }
-  catch (e){ const er = new Error(blockedCount === OVERPASS.length ? 'blocked' : 'busy'); er.detail = fails.join(', '); throw er; }
+  catch (e){ const er = new Error(blockedCount === OVERPASS.length + 1 ? 'blocked' : 'busy'); er.detail = fails.join(', '); throw er; }
   done = true; ctrls.forEach(c => c.abort());
   return buildRealMap(data, s, w, n, e, lat, name);
 }
@@ -1324,7 +1437,7 @@ function frame(now){
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
-window.__game = { get state(){ return state; }, get cars(){ return cars; }, get player(){ return player; }, get map(){ return map; }, buildRealMap, startPixel, keys, mouse };
+window.__game = { decodeMVT, mvtToElements, get state(){ return state; }, get cars(){ return cars; }, get player(){ return player; }, get map(){ return map; }, buildRealMap, startPixel, keys, mouse };
 })();
 </script>
 </body>
